@@ -5,8 +5,6 @@ const http = require('http');
 const socketIo = require('socket.io');
 const multer = require('multer');
 const path = require('path');
-const Room = require('./models/Room');
-const Message = require('./models/Message');
 const fs = require('fs');
 const helmet = require('helmet');
 
@@ -17,14 +15,10 @@ const server = http.createServer(app);
 app.use(helmet());
 app.use(helmet.hidePoweredBy());
 
-// CORS configuration for Tor
-app.use(cors({
-  origin: '*', // Allow all origins for Tor
-  methods: ['GET', 'POST'],
-  credentials: true
-}));
+// CORS configuration
+app.use(cors());
 
-// Socket.IO configuration for Tor
+// Socket.IO configuration
 const io = socketIo(server, {
   cors: {
     origin: '*',
@@ -42,130 +36,282 @@ mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
+// File cleanup configuration
+const FILE_EXPIRY_TIME = 30 * 60 * 1000; // 30 minutes in milliseconds
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // Run cleanup every 5 minutes
+const uploadedFiles = new Map(); // Track uploaded files and their expiry timers
+
+// Function to delete file and update database
+const deleteFile = async (filename, fileUrl) => {
+  try {
+    const filePath = path.join(__dirname, 'uploads', filename);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log(`Deleted file: ${filename}`);
+    }
+    await Message.updateMany(
+      { 'fileUrl': fileUrl },
+      { $set: { text: 'File expired (automatically removed after 30 minutes)', fileUrl: null }}
+    );
+    uploadedFiles.delete(filename);
+  } catch (error) {
+    console.error('Error deleting file:', error);
+  }
+};
+
+// Function to clean up expired files
+const cleanupExpiredFiles = async () => {
+  try {
+    const uploadsDir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+      fs.mkdirSync(uploadsDir);
+      return;
+    }
+
+    const files = fs.readdirSync(uploadsDir);
+    const now = Date.now();
+
+    for (const file of files) {
+      const filePath = path.join(uploadsDir, file);
+      const stats = fs.statSync(filePath);
+      const fileAge = now - stats.mtimeMs;
+
+      // If file is older than 30 minutes, delete it
+      if (fileAge >= FILE_EXPIRY_TIME) {
+        const fileUrl = `/uploads/${file}`;
+        await deleteFile(file, fileUrl);
+      }
+    }
+  } catch (error) {
+    console.error('Error during file cleanup:', error);
+  }
+};
+
+// Start periodic cleanup
+setInterval(cleanupExpiredFiles, CLEANUP_INTERVAL);
+
+// Run cleanup on startup
+cleanupExpiredFiles();
+
+// MongoDB Schema
+const MessageSchema = new mongoose.Schema({
+  room: String,
+  username: String,
+  text: String,
+  type: { type: String, default: 'text' },
+  fileName: String,
+  fileUrl: String,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const UserSchema = new mongoose.Schema({
+  room: String,
+  username: String,
+  joinedAt: { type: Date, default: Date.now }
+});
+
+const Message = mongoose.model('Message', MessageSchema);
+const User = mongoose.model('User', UserSchema);
+
 // File upload configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
+    if (!fs.existsSync('uploads')) {
+      fs.mkdirSync('uploads');
+    }
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
   }
 });
 
 const upload = multer({ storage });
 
-// Generate unique room code
-function generateRoomCode() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
-}
-
-// API Routes
-app.post('/api/rooms', async (req, res) => {
-  try {
-    const { creator, saveMessages } = req.body;
-    const roomCode = generateRoomCode();
-    
-    const room = new Room({
-      roomCode,
-      creator,
-      saveMessages
-    });
-    
-    await room.save();
-    console.log('Room created:', roomCode);
-    res.json({ roomCode });
-  } catch (error) {
-    console.error('Failed to create room:', error);
-    res.status(500).json({ error: 'Failed to create room' });
-  }
-});
-
-app.get('/api/rooms/:roomCode', async (req, res) => {
-  try {
-    const room = await Room.findOne({ roomCode: req.params.roomCode });
-    if (!room) {
-      return res.status(404).json({ error: 'Room not found' });
-    }
-    res.json(room);
-  } catch (error) {
-    console.error('Failed to fetch room:', error);
-    res.status(500).json({ error: 'Failed to fetch room' });
-  }
-});
-
-app.get('/api/messages/:roomCode', async (req, res) => {
-  try {
-    const messages = await Message.find({ roomCode: req.params.roomCode })
-      .sort({ createdAt: 1 });
-    res.json(messages);
-  } catch (error) {
-    console.error('Failed to fetch messages:', error);
-    res.status(500).json({ error: 'Failed to fetch messages' });
-  }
-});
-
-app.post('/api/upload', upload.single('file'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-  res.json({ 
-    url: `/uploads/${req.file.filename}`,
-    type: req.file.mimetype
-  });
-});
+// Store active users
+const rooms = new Map();
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
+  console.log('New client connected');
 
-  socket.on('joinRoom', async ({ roomCode, nickname }) => {
-    try {
-      console.log(`User ${nickname} joining room ${roomCode}`);
-      socket.join(roomCode);
-      io.to(roomCode).emit('userJoined', { nickname });
-    } catch (error) {
-      console.error('Error joining room:', error);
+  socket.on('joinRoom', async ({ username, room }) => {
+    socket.join(room);
+
+    // Add user to room
+    if (!rooms.has(room)) {
+      rooms.set(room, new Set());
     }
+    rooms.get(room).add(username);
+
+    // Save user to database
+    const user = new User({ room, username });
+    await user.save();
+
+    // Get all users who have ever joined this room
+    const pastUsers = await User.find({ room }).sort('-joinedAt');
+    const uniquePastUsers = [...new Set(pastUsers.map(u => u.username))];
+
+    // Get previous messages
+    const messages = await Message.find({ room }).sort('createdAt');
+
+    // Send room information to the user
+    socket.emit('roomData', {
+      room,
+      users: Array.from(rooms.get(room)),
+      pastUsers: uniquePastUsers,
+      messages
+    });
+
+    // Broadcast to others
+    socket.broadcast.to(room).emit('message', {
+      username: 'System',
+      text: `${username} has joined the chat`
+    });
+
+    // Send users and room info
+    io.to(room).emit('roomUsers', {
+      room,
+      users: Array.from(rooms.get(room))
+    });
   });
 
-  socket.on('sendMessage', async ({ roomCode, sender, content, fileUrl, fileType }) => {
-    try {
-      console.log('New message:', { roomCode, sender, content });
-      const room = await Room.findOne({ roomCode });
-      
-      if (room && room.saveMessages) {
-        const message = new Message({
-          roomCode,
-          sender,
-          content,
-          fileUrl,
-          fileType
-        });
-        await message.save();
-      }
+  socket.on('chatMessage', async (message) => {
+    const user = Array.from(socket.rooms)[1]; // Get room name
+    if (!user) return;
 
-      io.to(roomCode).emit('newMessage', {
-        sender,
-        content,
-        fileUrl,
-        fileType,
-        timestamp: new Date()
-      });
-    } catch (error) {
-      console.error('Error sending message:', error);
-    }
+    const messageDoc = new Message({
+      room: user,
+      username: message.username,
+      text: message.text
+    });
+    await messageDoc.save();
+
+    io.to(user).emit('message', messageDoc);
   });
 
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+    console.log('Client disconnected');
+    rooms.forEach((users, room) => {
+      users.forEach(user => {
+        if (socket.rooms.has(room)) {
+          users.delete(user);
+          io.to(room).emit('roomUsers', {
+            room,
+            users: Array.from(users)
+          });
+        }
+      });
+    });
   });
 });
 
+// File upload endpoint
+app.post('/upload', upload.single('file'), async (req, res) => {
+  try {
+    const { room, username } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+
+    // Set expiry timer for the file
+    const timer = setTimeout(() => {
+      deleteFile(req.file.filename, fileUrl);
+      
+      // Emit file expiry message to the room
+      io.to(room).emit('message', {
+        type: 'system',
+        username: 'System',
+        text: `File "${req.file.originalname}" has expired and been removed.`
+      });
+    }, FILE_EXPIRY_TIME);
+
+    // Track the file and its timer
+    uploadedFiles.set(req.file.filename, {
+      timer,
+      room,
+      originalName: req.file.originalname
+    });
+
+    const message = new Message({
+      room,
+      username,
+      type: 'file',
+      fileName: req.file.originalname,
+      fileUrl: fileUrl,
+      text: `Shared a file: ${req.file.originalname} (expires in 30 minutes)`
+    });
+    await message.save();
+
+    // Emit the file message to all users in the room
+    io.to(room).emit('message', {
+      type: 'file',
+      username,
+      fileName: req.file.originalname,
+      fileUrl: fileUrl,
+      text: `Shared a file: ${req.file.originalname} (expires in 30 minutes)`
+    });
+
+    res.json({
+      success: true,
+      fileName: req.file.filename,
+      fileUrl: fileUrl
+    });
+  } catch (error) {
+    console.error('File upload error:', error);
+    res.status(500).json({ error: 'File upload failed' });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('To access via Tor:');
-  console.log('1. Make sure Tor Browser is running');
-  console.log('2. Configure your Tor hidden service');
-  console.log('3. Access your .onion address through Tor Browser');
+});
+
+// Cleanup on server shutdown
+process.on('SIGINT', async () => {
+  console.log('\nStarting cleanup before shutdown...');
+  
+  // Clear all timers
+  for (const [filename, { timer }] of uploadedFiles) {
+    clearTimeout(timer);
+  }
+  
+  try {
+    // Delete all files in uploads directory
+    const uploadsDir = path.join(__dirname, 'uploads');
+    if (fs.existsSync(uploadsDir)) {
+      const files = fs.readdirSync(uploadsDir);
+      
+      // Update all file messages in the database
+      await Message.updateMany(
+        { type: 'file', fileUrl: { $ne: null } },
+        { $set: { text: 'File removed (server shutdown)', fileUrl: null } }
+      );
+      
+      // Delete all files
+      for (const file of files) {
+        const filePath = path.join(uploadsDir, file);
+        fs.unlinkSync(filePath);
+      }
+      
+      console.log('All uploaded files cleaned up successfully');
+    }
+  } catch (error) {
+    console.error('Error during shutdown cleanup:', error);
+  }
+  
+  // Close database connection
+  try {
+    await mongoose.connection.close();
+    console.log('Database connection closed');
+  } catch (error) {
+    console.error('Error closing database connection:', error);
+  }
+  
+  console.log('Cleanup completed. Shutting down...');
+  process.exit(0);
 });
