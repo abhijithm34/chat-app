@@ -22,71 +22,59 @@ const ChatRoom = () => {
     const navigate = useNavigate();
 
     useEffect(() => {
-        // Initialize socket connection
-        const newSocket = io(ENDPOINT, {
-            transports: ['websocket'],
-            upgrade: false
-        });
+        const newSocket = io(ENDPOINT);
         setSocket(newSocket);
 
-        // Cleanup on unmount
         return () => {
-            if (newSocket) {
-                newSocket.disconnect();
-            }
+            newSocket.disconnect();
         };
-    }, []); // Only run once on component mount
+    }, []);
 
     useEffect(() => {
-        if (!socket) return;
+        if (socket) {
+            socket.on('roomData', ({ users, pastUsers, messages, persist }) => {
+                setUsers(users);
+                setPastUsers(pastUsers);
+                if (messages) {
+                    setMessages(messages);
+                }
+                setSaveToDB(persist);
+            });
 
-        // Set up socket event listeners
-        socket.on('connect', () => {
-            console.log('Connected to server');
-        });
+            socket.on('roomUsers', ({ users }) => {
+                setUsers(users);
+            });
 
-        socket.on('messageHistory', (history) => {
-            setMessages(history);
-            scrollToBottom();
-        });
+            socket.on('updatePastUsers', ({ pastUsers }) => {
+                setPastUsers(pastUsers);
+            });
 
-        socket.on('message', (message) => {
-            setMessages((prevMessages) => [...prevMessages, message]);
-            scrollToBottom();
-        });
+            socket.on('message', (message) => {
+                setMessages(prev => [...prev, message]);
+                scrollToBottom();
+            });
 
-        socket.on('roomData', ({ users, pastUsers, messages: roomMessages }) => {
-            setUsers(users);
-            setPastUsers(pastUsers);
-            setMessages(roomMessages);
-        });
+            socket.on('error', (error) => {
+                setError(error);
+                setTimeout(() => setError(''), 3000);
+            });
 
-        socket.on('roomUsers', ({ users }) => {
-            setUsers(users);
-        });
+            return () => {
+                socket.off('roomData');
+                socket.off('roomUsers');
+                socket.off('updatePastUsers');
+                socket.off('message');
+                socket.off('error');
+            };
+        }
+    }, [socket]);
 
-        socket.on('fileShared', (fileInfo) => {
-            setMessages((prevMessages) => [...prevMessages, {
-                type: 'file',
-                username: fileInfo.user,
-                fileName: fileInfo.fileName,
-                fileUrl: `${ENDPOINT}/uploads/${fileInfo.fileName}`
-            }]);
-        });
-
-        socket.on('error', (error) => {
-            setError(error);
-            setTimeout(() => setError(null), 5000);
-        });
-
+    // Cleanup on component unmount
+    useEffect(() => {
         return () => {
-            socket.off('connect');
-            socket.off('messageHistory');
-            socket.off('message');
-            socket.off('roomData');
-            socket.off('roomUsers');
-            socket.off('fileShared');
-            socket.off('error');
+            if (socket) {
+                socket.disconnect();
+            }
         };
     }, [socket]);
 
@@ -111,7 +99,7 @@ const ChatRoom = () => {
             socket.emit('joinRoom', { 
                 username: nickname, 
                 room,
-                persist: false, // Joiners don't control persistence
+                persist: false,
                 isCreator: false 
             });
             setIsJoined(true);
@@ -126,13 +114,15 @@ const ChatRoom = () => {
                 return;
             }
 
+            // Emit the message to the server
             socket.emit('message', {
                 room,
                 username: nickname,
                 text: message,
-                persist: saveToDB
+                type: 'text'
             });
 
+            // Clear the input field
             setMessage('');
         }
     };
@@ -229,13 +219,13 @@ const ChatRoom = () => {
         <div className="chat-container">
             <div className="chat-sidebar">
                 <h3>Room: {room}</h3>
-                <h4>Active Users:</h4>
+                <h4>Active Users ({users.length}):</h4>
                 <ul>
                     {users.map((user, index) => (
                         <li key={index}>{user}</li>
                     ))}
                 </ul>
-                <h4>Past Users:</h4>
+                <h4>Past Users ({pastUsers.length}):</h4>
                 <ul className="past-users">
                     {pastUsers.map((user, index) => (
                         <li key={index}>{user}</li>
@@ -244,7 +234,7 @@ const ChatRoom = () => {
             </div>
             <div className="chat-main">
                 <div className="chat-messages">
-                    {messages.map((msg, index) => (
+                    {messages && messages.map((msg, index) => (
                         <div key={index} className="message">
                             {msg.type === 'file' ? (
                                 <p>
