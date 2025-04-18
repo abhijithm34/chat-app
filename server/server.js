@@ -132,63 +132,92 @@ const upload = multer({ storage });
 // Store active users
 const rooms = new Map();
 
+// Store room persistence settings
+const roomPersistence = new Map();
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
   console.log('New client connected');
 
-  socket.on('joinRoom', async ({ username, room }) => {
-    socket.join(room);
+  socket.on('joinRoom', async ({ username, room, persist, isCreator }) => {
+    try {
+      // Join the room
+      socket.join(room);
+      
+      // If this is the room creator, set the persistence setting
+      if (isCreator) {
+        roomPersistence.set(room, persist);
+      }
 
-    // Add user to room
-    if (!rooms.has(room)) {
-      rooms.set(room, new Set());
+      // Add user to the room
+      if (!rooms.has(room)) {
+        rooms.set(room, new Set());
+      }
+      rooms.get(room).add(username);
+
+      // Get past users from MongoDB
+      const pastUsers = await User.find({ room }).sort('-joinedAt');
+      const uniquePastUsers = [...new Set(pastUsers.map(u => u.username))];
+      
+      // Get message history if persistence is enabled
+      let messageHistory = [];
+      if (roomPersistence.get(room)) {
+        messageHistory = await Message.find({ room }).sort('createdAt');
+      }
+
+      // Send room data to the user
+      socket.emit('roomData', {
+        room,
+        users: Array.from(rooms.get(room)),
+        pastUsers: uniquePastUsers,
+        messages: messageHistory,
+        persist: roomPersistence.get(room)
+      });
+
+      // Notify others in the room
+      socket.broadcast.to(room).emit('message', {
+        username: 'System',
+        text: `${username} has joined the chat`
+      });
+
+      // Send users and room info
+      io.to(room).emit('roomUsers', {
+        room,
+        users: Array.from(rooms.get(room))
+      });
+    } catch (error) {
+      console.error('Error joining room:', error);
+      socket.emit('error', 'Failed to join room');
     }
-    rooms.get(room).add(username);
-
-    // Save user to database
-    const user = new User({ room, username });
-    await user.save();
-
-    // Get all users who have ever joined this room
-    const pastUsers = await User.find({ room }).sort('-joinedAt');
-    const uniquePastUsers = [...new Set(pastUsers.map(u => u.username))];
-
-    // Get previous messages
-    const messages = await Message.find({ room }).sort('createdAt');
-
-    // Send room information to the user
-    socket.emit('roomData', {
-      room,
-      users: Array.from(rooms.get(room)),
-      pastUsers: uniquePastUsers,
-      messages
-    });
-
-    // Broadcast to others
-    socket.broadcast.to(room).emit('message', {
-      username: 'System',
-      text: `${username} has joined the chat`
-    });
-
-    // Send users and room info
-    io.to(room).emit('roomUsers', {
-      room,
-      users: Array.from(rooms.get(room))
-    });
   });
 
-  socket.on('chatMessage', async (message) => {
-    const user = Array.from(socket.rooms)[1]; // Get room name
-    if (!user) return;
+  socket.on('message', async (data) => {
+    try {
+      const { room, username, text, type = 'text' } = data;
+      
+      // Save message to MongoDB if persistence is enabled for this room
+      if (roomPersistence.get(room)) {
+        const message = new Message({
+          room,
+          username,
+          text,
+          type,
+          createdAt: new Date()
+        });
+        await message.save();
+      }
 
-    const messageDoc = new Message({
-      room: user,
-      username: message.username,
-      text: message.text
-    });
-    await messageDoc.save();
-
-    io.to(user).emit('message', messageDoc);
+      // Broadcast the message to everyone in the room
+      io.to(room).emit('message', {
+        username,
+        text,
+        type,
+        createdAt: new Date()
+      });
+    } catch (error) {
+      console.error('Error handling message:', error);
+      socket.emit('error', 'Failed to send message');
+    }
   });
 
   socket.on('disconnect', () => {
@@ -205,64 +234,88 @@ io.on('connection', (socket) => {
       });
     });
   });
+
+  socket.on('join', async ({ nickname, room }) => {
+    try {
+      socket.join(room);
+      
+      // Create user record
+      const user = new User({
+        socketId: socket.id,
+        nickname,
+        room
+      });
+      await user.save();
+
+      // Fetch persisted messages for the room
+      const messages = await Message.find({ room })
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean();
+
+      // Send persisted messages to the joining user
+      socket.emit('messageHistory', messages.reverse());
+
+      // Broadcast user list update
+      const users = await User.find({ room });
+      io.to(room).emit('userList', users);
+
+      // Send welcome message
+      socket.emit('message', {
+        type: 'system',
+        text: `Welcome to ${room}, ${nickname}!`
+      });
+
+      // Broadcast join notification
+      socket.broadcast.to(room).emit('message', {
+        type: 'system',
+        text: `${nickname} has joined the room`
+      });
+    } catch (error) {
+      console.error('Join room error:', error);
+      socket.emit('error', 'Could not join room');
+    }
+  });
 });
 
 // File upload endpoint
 app.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    const { room, username } = req.body;
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    const { room, username, persist } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ success: false, error: 'No file uploaded' });
     }
 
-    const fileUrl = `/uploads/${req.file.filename}`;
-
-    // Set expiry timer for the file
-    const timer = setTimeout(() => {
-      deleteFile(req.file.filename, fileUrl);
-      
-      // Emit file expiry message to the room
-      io.to(room).emit('message', {
-        type: 'system',
-        username: 'System',
-        text: `File "${req.file.originalname}" has expired and been removed.`
+    // Save file info to MongoDB if persistence is enabled for this room
+    if (roomPersistence.get(room)) {
+      const message = new Message({
+        room,
+        username,
+        text: file.originalname,
+        type: 'file',
+        fileName: file.originalname,
+        fileUrl: `/uploads/${file.filename}`,
+        createdAt: new Date()
       });
-    }, FILE_EXPIRY_TIME);
+      await message.save();
+    }
 
-    // Track the file and its timer
-    uploadedFiles.set(req.file.filename, {
-      timer,
-      room,
-      originalName: req.file.originalname
-    });
-
-    const message = new Message({
-      room,
-      username,
-      type: 'file',
-      fileName: req.file.originalname,
-      fileUrl: fileUrl,
-      text: `Shared a file: ${req.file.originalname} (expires in 30 minutes)`
-    });
-    await message.save();
-
-    // Emit the file message to all users in the room
+    // Broadcast the file message to everyone in the room
     io.to(room).emit('message', {
-      type: 'file',
       username,
-      fileName: req.file.originalname,
-      fileUrl: fileUrl,
-      text: `Shared a file: ${req.file.originalname} (expires in 30 minutes)`
+      text: file.originalname,
+      type: 'file',
+      fileName: file.originalname,
+      fileUrl: `/uploads/${file.filename}`,
+      createdAt: new Date()
     });
 
-    res.json({
-      success: true,
-      fileName: req.file.filename,
-      fileUrl: fileUrl
-    });
+    res.json({ success: true, fileUrl: `/uploads/${file.filename}` });
   } catch (error) {
-    console.error('File upload error:', error);
-    res.status(500).json({ error: 'File upload failed' });
+    console.error('Error handling file upload:', error);
+    res.status(500).json({ success: false, error: 'Failed to upload file' });
   }
 });
 

@@ -14,21 +14,45 @@ const ChatRoom = () => {
     const [users, setUsers] = useState([]);
     const [pastUsers, setPastUsers] = useState([]);
     const [isJoined, setIsJoined] = useState(false);
+    const [saveToDB, setSaveToDB] = useState(true);
+    const [fileUploading, setFileUploading] = useState(false);
+    const [error, setError] = useState('');
+    const [isCreatingRoom, setIsCreatingRoom] = useState(false);
     const messagesEndRef = useRef(null);
     const navigate = useNavigate();
 
     useEffect(() => {
-        const newSocket = io(ENDPOINT);
+        // Initialize socket connection
+        const newSocket = io(ENDPOINT, {
+            transports: ['websocket'],
+            upgrade: false
+        });
         setSocket(newSocket);
 
-        return () => newSocket.close();
-    }, []);
+        // Cleanup on unmount
+        return () => {
+            if (newSocket) {
+                newSocket.disconnect();
+            }
+        };
+    }, []); // Only run once on component mount
 
     useEffect(() => {
         if (!socket) return;
 
+        // Set up socket event listeners
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('messageHistory', (history) => {
+            setMessages(history);
+            scrollToBottom();
+        });
+
         socket.on('message', (message) => {
             setMessages((prevMessages) => [...prevMessages, message]);
+            scrollToBottom();
         });
 
         socket.on('roomData', ({ users, pastUsers, messages: roomMessages }) => {
@@ -50,83 +74,112 @@ const ChatRoom = () => {
             }]);
         });
 
+        socket.on('error', (error) => {
+            setError(error);
+            setTimeout(() => setError(null), 5000);
+        });
+
         return () => {
+            socket.off('connect');
+            socket.off('messageHistory');
             socket.off('message');
             socket.off('roomData');
             socket.off('roomUsers');
             socket.off('fileShared');
+            socket.off('error');
         };
     }, [socket]);
 
-    useEffect(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+    const handleCreateRoom = (e) => {
+        e.preventDefault();
+        if (nickname && socket) {
+            const newRoom = Math.random().toString(36).substring(7);
+            setRoom(newRoom);
+            socket.emit('joinRoom', { 
+                username: nickname, 
+                room: newRoom,
+                persist: saveToDB,
+                isCreator: true 
+            });
+            setIsJoined(true);
+        }
+    };
 
     const handleJoinRoom = (e) => {
         e.preventDefault();
-        if (nickname && room) {
-            socket.emit('joinRoom', { username: nickname, room });
+        if (nickname && room && socket) {
+            socket.emit('joinRoom', { 
+                username: nickname, 
+                room,
+                persist: false, // Joiners don't control persistence
+                isCreator: false 
+            });
             setIsJoined(true);
         }
     };
 
-    const handleCreateRoom = (e) => {
-        e.preventDefault();
-        if (nickname) {
-            const newRoom = Math.random().toString(36).substring(7);
-            setRoom(newRoom);
-            socket.emit('joinRoom', { username: nickname, room: newRoom });
-            setIsJoined(true);
-        }
-    };
+    const handleMessageSubmit = async (event) => {
+        event.preventDefault();
+        if (message.trim() && socket) {
+            if (message.length > 1000) {
+                setError('Message too long');
+                return;
+            }
 
-    const sendMessage = (e) => {
-        e.preventDefault();
-        if (message && socket) {
-            socket.emit('chatMessage', { username: nickname, text: message });
+            socket.emit('message', {
+                room,
+                username: nickname,
+                text: message,
+                persist: saveToDB
+            });
+
             setMessage('');
         }
     };
 
-    const handleFileUpload = async (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
+    const handleFileUpload = async (event) => {
+        const file = event.target.files[0];
+        if (!file || !socket) return;
+        
+        if (file.size > 5 * 1024 * 1024) {
+            setError('File size exceeds 5MB limit');
+            return;
+        }
 
-        // Show loading state
-        const fileInput = e.target;
-        const label = fileInput.nextElementSibling;
-        const originalLabelText = label.innerHTML;
-        label.innerHTML = '<span class="file-icon">⏳</span> Uploading...';
-
+        setFileUploading(true);
         const formData = new FormData();
         formData.append('file', file);
         formData.append('room', room);
         formData.append('username', nickname);
+        formData.append('persist', saveToDB);
 
         try {
             const response = await fetch(`${ENDPOINT}/upload`, {
                 method: 'POST',
-                body: formData,
+                body: formData
             });
-            
-            if (!response.ok) {
-                throw new Error('Upload failed');
-            }
 
             const data = await response.json();
             if (!data.success) {
-                throw new Error(data.error || 'Upload failed');
+                throw new Error(data.error);
             }
 
-            // Reset the file input
-            fileInput.value = '';
-            label.innerHTML = originalLabelText;
+            setFileUploading(false);
         } catch (error) {
-            console.error('Error uploading file:', error);
-            alert('Failed to upload file. Please try again.');
-            label.innerHTML = originalLabelText;
+            setError('File upload failed');
+            setFileUploading(false);
         }
     };
+
+    const scrollToBottom = () => {
+        if (messagesEndRef.current) {
+            messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+    };
+
+    useEffect(() => {
+        scrollToBottom();
+    }, [messages]);
 
     if (!isJoined) {
         return (
@@ -146,6 +199,23 @@ const ChatRoom = () => {
                         value={room}
                         onChange={(e) => setRoom(e.target.value)}
                     />
+                    {!room && (
+                        <div className="persistence-toggle">
+                            <label className="toggle-label">
+                                <input
+                                    type="checkbox"
+                                    checked={saveToDB}
+                                    onChange={(e) => setSaveToDB(e.target.checked)}
+                                />
+                                Save Messages in Room
+                            </label>
+                            {!saveToDB && (
+                                <span className="toggle-hint">
+                                    Messages won't be stored and will be lost when you leave
+                                </span>
+                            )}
+                        </div>
+                    )}
                     <div className="button-group">
                         <button onClick={handleCreateRoom}>Create Room</button>
                         <button onClick={handleJoinRoom}>Join Room</button>
@@ -180,11 +250,11 @@ const ChatRoom = () => {
                                 <p>
                                     <span className="user">{msg.username}: </span>
                                     <a 
-                                        href={`${ENDPOINT}${msg.fileUrl}`} 
+                                        href={msg.fileUrl ? `${ENDPOINT}${msg.fileUrl}` : '#'} 
                                         download={msg.fileName}
                                         target="_blank" 
                                         rel="noopener noreferrer" 
-                                        className="file-link"
+                                        className={`file-link ${!msg.fileUrl ? 'expired' : ''}`}
                                     >
                                         <span className="file-icon">📎</span>
                                         {msg.text || `Download ${msg.fileName}`}
@@ -201,7 +271,7 @@ const ChatRoom = () => {
                     <div ref={messagesEndRef} />
                 </div>
                 <div className="chat-form-container">
-                    <form onSubmit={sendMessage}>
+                    <form onSubmit={handleMessageSubmit}>
                         <input
                             type="text"
                             placeholder="Enter Message"
@@ -216,11 +286,14 @@ const ChatRoom = () => {
                             onChange={handleFileUpload}
                             id="file-input"
                             accept="image/*,.pdf,.doc,.docx,.txt"
+                            disabled={fileUploading}
                         />
                         <label htmlFor="file-input">
-                            <span className="file-icon">📎</span> Upload File
+                            <span className="file-icon">📎</span> 
+                            {fileUploading ? 'Uploading...' : 'Upload File'}
                         </label>
                     </div>
+                    {error && <div className="error-message">{error}</div>}
                 </div>
             </div>
         </div>
