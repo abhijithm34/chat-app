@@ -14,7 +14,8 @@ const ChatRoom = () => {
     const [users, setUsers] = useState([]);
     const [pastUsers, setPastUsers] = useState([]);
     const [isJoined, setIsJoined] = useState(false);
-    const [saveToDB, setSaveToDB] = useState(true);
+    const [saveToDB, setSaveToDB] = useState(false);
+    const [isCreator, setIsCreator] = useState(false);
     const [fileUploading, setFileUploading] = useState(false);
     const [error, setError] = useState('');
     const [isCreatingRoom, setIsCreatingRoom] = useState(false);
@@ -32,13 +33,14 @@ const ChatRoom = () => {
 
     useEffect(() => {
         if (socket) {
-            socket.on('roomData', ({ users, pastUsers, messages, persist }) => {
+            socket.on('roomData', ({ users, pastUsers, messages, persist, isCreator: creator }) => {
                 setUsers(users);
                 setPastUsers(pastUsers);
                 if (messages) {
                     setMessages(messages);
                 }
                 setSaveToDB(persist);
+                setIsCreator(creator);
             });
 
             socket.on('roomUsers', ({ users }) => {
@@ -231,6 +233,26 @@ const ChatRoom = () => {
                         <li key={index}>{user}</li>
                     ))}
                 </ul>
+                {isCreator && (
+                    <div className="persistence-toggle">
+                        <label className="toggle-label">
+                            <input
+                                type="checkbox"
+                                checked={saveToDB}
+                                onChange={(e) => {
+                                    setSaveToDB(e.target.checked);
+                                    socket.emit('joinRoom', {
+                                        username: nickname,
+                                        room,
+                                        persist: e.target.checked,
+                                        isCreator: true
+                                    });
+                                }}
+                            />
+                            Save Messages in Room
+                        </label>
+                    </div>
+                )}
             </div>
             <div className="chat-main">
                 <div className="chat-messages">
